@@ -1,10 +1,15 @@
 import feedparser
-from pymongo import MongoClient
+import pytz
+from datetime import datetime
 from bs4 import BeautifulSoup
+from mongo import arxiv_db
 import html
 import re
 import time
 from tqdm import tqdm
+import schedule
+import logging
+from requests.exceptions import RequestException
 
 def clean_html(html_content):
 	"""Remove HTML tags and return plain text."""
@@ -53,38 +58,73 @@ def convert_data(source_data):
 	
 	return target_data
 
-# Connect to your MongoDB instance
-client = MongoClient()
-collection = client.mail.arxiv
 
-from pprint import pprint
 # Parse the RSS feed
-rss_feed_urls = ['http://rss.arxiv.org/rss/cs.CL']
+rss_feed_urls = ['https://rss.arxiv.org/rss/cs.CL']
 def parse():
+	logging.info("Parsing RSS feeds...")
 	for rss_feed_url in rss_feed_urls:
-		feed = feedparser.parse(rss_feed_url)
-		time = feed.feed.updated_parsed
+		retry_count = 0
+		max_retries = 10
+		while retry_count < max_retries:
+			try:
+				feed = feedparser.parse(rss_feed_url)
+				if feed.entries:
+					break
+				logging.warning(f"Feed is empty. Retry {retry_count + 1} of {max_retries}...")
+				time.sleep(60)
+				retry_count += 1
+			except RequestException as e:
+				logging.error(f"Network error occurred: {e}. Retry {retry_count + 1} of {max_retries}...")
+				time.sleep(60)
+				retry_count += 1
+
+		if retry_count == max_retries:
+			logging.error(f"Failed to fetch feed after {max_retries} attempts. Skipping this URL.")
+			continue
+
+		updated_parsed = feed.feed.get('updated_parsed')
+		if updated_parsed is None:
+			# Fallback to current time if 'updated_parsed' is not available
+			updated_parsed = datetime.now().timetuple()
 		for entry in tqdm(feed.entries):
 			try:
-			# if True:
 				entry = clean_entry(entry)
-				entry["date"] = time
-				entry["email_date"] = time
-				status = entry["status"]
+				entry["date"] = updated_parsed
+				entry["email_date"] = updated_parsed
 				entry = convert_data(entry)
 				entry["ParserVer"] = "2.1"
-				if status!="new":
-					del entry["email_date"], entry["date"]
-				# pprint(entry)
-				collection.update_one(dict(id=entry["id"]),{"$set":entry},upsert=True)
+				
+				# Use update_one with $setOnInsert to avoid changing existing fields
+				arxiv_db.update_one(
+					{"id": entry["id"]},
+					{"$setOnInsert": entry},
+					upsert=True
+				)
 			except Exception as e:
 				print(e)
 
-parse()
-
-while True:
+def job():
 	try:
 		parse()
-	except:
-		pass
-	time.sleep(23 * 60 * 60)  # Sleeps for 4 hours
+	except Exception as e:
+		logging.exception(f"Error occurred during parsing: {e}")
+
+def is_weekday():
+	return datetime.now(pytz.timezone('US/Eastern')).weekday() < 5
+
+def run_schedule():
+	while True:
+		schedule.run_pending()
+		time.sleep(1)
+
+if __name__ == "__main__":
+	logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+	
+	# Schedule the job to run at NST +10 minutes on weekdays
+	job_schedule = schedule.every().day.at("13:10").do(job)
+	if is_weekday():
+		job_schedule
+
+	# Run the scheduled job
+	run_schedule()
